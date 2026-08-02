@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+require() {
+    command -v "$1" >/dev/null 2>&1 ||
+        die "$1 is not installed"
+}
+
+for dependency in \
+    bwrap \
+    envsubst \
+    flock \
+    jq \
+    realpath \
+    sha256sum
+do
+    require "$dependency"
+done
+
+(($# > 0)) ||
+    die "no command specified"
+
+[[ -n "${HOME:-}" ]] ||
+    die "HOME is not set"
+
+[[ -n "${XDG_RUNTIME_DIR:-}" ]] ||
+    die "XDG_RUNTIME_DIR is not set"
+
+[[ -d "$XDG_RUNTIME_DIR" ]] ||
+    die "XDG_RUNTIME_DIR does not exist: $XDG_RUNTIME_DIR"
+
+[[ -w "$XDG_RUNTIME_DIR" ]] ||
+    die "XDG_RUNTIME_DIR is not writable: $XDG_RUNTIME_DIR"
+
+workdir="$(pwd -P)"
+home_root="$(realpath "$HOME")"
+runtime_root="$(realpath "$XDG_RUNTIME_DIR")"
+
+# Make ${PWD} in path policies refer to the physical invocation directory.
+export PWD="$workdir"
+
+bwrap_path="$(command -v bwrap)"
+bwrap_path="$(realpath "$bwrap_path")"
+
+case "$bwrap_path" in
+    "$workdir"|"$workdir"/*)
+        die "refusing to use bubblewrap from the working directory: $bwrap_path"
+        ;;
+esac
+
+"$bwrap_path" --help 2>&1 | grep -q -- '--overlay-src' ||
+    die "installed bubblewrap does not support persistent overlays"
+
+sandbox_id="$(
+    printf '%s' "$workdir" |
+        sha256sum |
+        cut -d' ' -f1
+)"
+
+sandbox_root="$runtime_root/simple-sandbox/$sandbox_id"
+home_upper="$sandbox_root/home-upper"
+home_work="$sandbox_root/home-work"
+sandbox_runtime="$sandbox_root/runtime"
+overlays_root="$sandbox_root/overlays"
+lock_file="$sandbox_root/lock"
+
+mkdir -p \
+    "$home_upper" \
+    "$home_work" \
+    "$sandbox_runtime" \
+    "$overlays_root"
+
+chmod 700 \
+    "$sandbox_root" \
+    "$home_upper" \
+    "$home_work" \
+    "$sandbox_runtime" \
+    "$overlays_root"
+
+if [[ -n "${SIMPLE_SANDBOX_CONFIG:-}" ]]; then
+    config_file="$(realpath -m -- "$SIMPLE_SANDBOX_CONFIG")"
+
+    [[ -f "$config_file" ]] ||
+        die "configuration file does not exist: $config_file"
+else
+    config_file="${XDG_CONFIG_HOME:-$HOME/.config}/simple-sandbox.json"
+
+    [[ -f "$config_file" ]] ||
+        config_file=""
+fi
+
+unset_vars=()
+
+if [[ -n "$config_file" ]]; then
+    jq -e '
+        type == "object"
+        and ((keys - ["paths", "unset"]) | length == 0)
+
+        and ((.paths // {}) | type == "object")
+        and all(
+            ((.paths // {}) | keys[]);
+            length > 0
+            and (contains("\n") | not)
+            and (contains("\u0000") | not)
+        )
+        and all(
+            (.paths // {})[];
+            IN("hide", "readonly", "expose", "overlay")
+        )
+
+        and ((.unset // []) | type == "array")
+        and all(
+            (.unset // [])[];
+            type == "string"
+            and test("^[A-Za-z_][A-Za-z0-9_]*$")
+        )
+    ' "$config_file" >/dev/null ||
+        die "invalid configuration: $config_file"
+
+    # Extract (path, action) pairs from the paths object, preserving
+    # configuration order. NUL-delimited so paths may contain spaces/tabs.
+    policy_paths=()
+    policy_actions=()
+
+    while IFS= read -r -d '' path && IFS= read -r -d '' action; do
+        policy_paths+=("$path")
+        policy_actions+=("$action")
+    done < <(
+        jq -j '(.paths // {}) | to_entries[] | (.key + "\u0000" + .value + "\u0000")' "$config_file"
+    )
+
+    mapfile -t unset_vars < <(
+        jq -r '.unset // [] | .[]' "$config_file"
+    )
+fi
+
+resolve_policy_path() {
+    local path="$1"
+    local variable
+
+    while IFS= read -r variable; do
+        [[ -v "$variable" ]] ||
+            die "unknown variable in path: $variable"
+    done < <(envsubst --variables "$path")
+
+    path="$(printf '%s\n' "$path" | envsubst)"
+
+    case "$path" in
+        "~")
+            path="$HOME"
+            ;;
+        "~/"*)
+            path="$HOME/${path:2}"
+            ;;
+    esac
+
+    if [[ "$path" != /* ]]; then
+        path="$workdir/$path"
+    fi
+
+    path="$(realpath -m -- "$path")"
+
+    [[ "$path" != "/" ]] ||
+        die "refusing to apply a path policy to the filesystem root"
+
+    printf '%s\n' "$path"
+}
+
+bwrap_args=(
+    --die-with-parent
+    --unshare-all
+    --share-net
+    --ro-bind / /
+    --proc /proc
+    --dev /dev
+)
+
+if [[ "$workdir" == "$home_root" ]]; then
+    bwrap_args+=(
+        --overlay-src "$home_root"
+        --overlay "$home_upper" "$home_work" "$home_root"
+    )
+elif [[ "$workdir" == "/" || "$home_root" == "$workdir/"* ]]; then
+    bwrap_args+=(
+        --bind "$workdir" "$workdir"
+        --overlay-src "$home_root"
+        --overlay "$home_upper" "$home_work" "$home_root"
+    )
+else
+    bwrap_args+=(
+        --overlay-src "$home_root"
+        --overlay "$home_upper" "$home_work" "$home_root"
+        --bind "$workdir" "$workdir"
+    )
+fi
+
+bwrap_args+=(
+    --tmpfs /tmp
+    --bind "$sandbox_runtime" "$runtime_root"
+)
+
+# Apply path policies from the configuration. Paths are mounted from
+# shortest to longest so that parent mounts are established before child
+# mounts inside them; for nested destinations the most specific (deepest)
+# path wins. The same resolved path with the same action is a redundant
+# no-op; conflicting actions for the same resolved path are a configuration
+# error.
+apply_path_policies() {
+    local -a resolved_paths
+    local -a resolved_actions
+    local -A seen_actions
+    local -a sorted_indices
+    local -i i
+    local idx
+    local path
+    local action
+    local overlay_id
+    local overlay_root
+    local overlay_upper
+    local overlay_work
+
+    # Resolve every policy path. Byte-identical duplicate keys in the JSON
+    # object are collapsed by jq; this check catches paths written
+    # differently that resolve to the same destination (e.g. "~/x" vs
+    # "/home/user/x"). The same resolved path with the same action is a
+    # redundant no-op and is kept once; conflicting actions for the same
+    # resolved path are a configuration error.
+    for ((i = 0; i < ${#policy_paths[@]}; i++)); do
+        path="$(resolve_policy_path "${policy_paths[i]}")"
+        action="${policy_actions[i]}"
+
+        if [[ -v "seen_actions[$path]" ]]; then
+            [[ "${seen_actions[$path]}" == "$action" ]] ||
+                die "conflicting path policies for $path: ${seen_actions[$path]} vs $action"
+            continue
+        fi
+        seen_actions["$path"]="$action"
+
+        resolved_paths+=("$path")
+        resolved_actions+=("$action")
+    done
+
+    # Order mounts from shortest to longest path so parent mounts precede
+    # child mounts; ties keep their configuration order.
+    while IFS=$'\t' read -r _ idx; do
+        sorted_indices+=("$idx")
+    done < <(
+        for ((i = 0; i < ${#resolved_paths[@]}; i++)); do
+            printf '%d\t%d\n' "${#resolved_paths[i]}" "$i"
+        done | sort -n -k1,1 -k2,2
+    )
+
+    for idx in "${sorted_indices[@]}"; do
+        path="${resolved_paths[idx]}"
+        action="${resolved_actions[idx]}"
+
+        [[ -e "$path" || -L "$path" ]] ||
+            continue
+
+        case "$action" in
+            hide)
+                if [[ -d "$path" ]]; then
+                    bwrap_args+=(--tmpfs "$path")
+                else
+                    bwrap_args+=(--ro-bind /dev/null "$path")
+                fi
+                ;;
+            readonly)
+                bwrap_args+=(--ro-bind "$path" "$path")
+                ;;
+            expose)
+                bwrap_args+=(--bind "$path" "$path")
+                ;;
+            overlay)
+                [[ -d "$path" ]] ||
+                    die "overlay path is not a directory: $path"
+
+                overlay_id="$(
+                    printf '%s' "$path" |
+                        sha256sum |
+                        cut -d' ' -f1
+                )"
+
+                overlay_root="$overlays_root/$overlay_id"
+                overlay_upper="$overlay_root/upper"
+                overlay_work="$overlay_root/work"
+
+                mkdir -p \
+                    "$overlay_upper" \
+                    "$overlay_work"
+
+                chmod 700 \
+                    "$overlay_root" \
+                    "$overlay_upper" \
+                    "$overlay_work"
+
+                bwrap_args+=(
+                    --overlay-src "$path"
+                    --overlay "$overlay_upper" "$overlay_work" "$path"
+                )
+                ;;
+            *)
+                die "unknown path policy: $action"
+                ;;
+        esac
+    done
+}
+
+# Paths are mounted from shortest to longest; the most specific (deepest)
+# path wins for nested destinations.
+apply_path_policies
+
+for name in "${unset_vars[@]}"; do
+    bwrap_args+=(--unsetenv "$name")
+done
+
+bwrap_args+=(
+    --setenv TMPDIR /tmp
+    --setenv XDG_RUNTIME_DIR "$runtime_root"
+    --chdir "$workdir"
+    --
+    "$@"
+)
+
+# One upper/work pair cannot safely back concurrent overlay mounts.
+exec 9>"$lock_file"
+flock -x 9
+
+exec "$bwrap_path" "${bwrap_args[@]}"
