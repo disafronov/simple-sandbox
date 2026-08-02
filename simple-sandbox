@@ -96,6 +96,8 @@ else
         config_file=""
 fi
 
+policy_paths=()
+policy_actions=()
 unset_vars=()
 
 if [[ -n "$config_file" ]]; then
@@ -124,16 +126,17 @@ if [[ -n "$config_file" ]]; then
     ' "$config_file" >/dev/null ||
         die "invalid configuration: $config_file"
 
-    # Extract (path, action) pairs from the paths object, preserving
-    # configuration order. NUL-delimited so paths may contain spaces/tabs.
-    policy_paths=()
-    policy_actions=()
-
+    # Extract (path, action) pairs while preserving JSON object order.
+    # NUL delimiters preserve spaces and tabs in paths.
     while IFS= read -r -d '' path && IFS= read -r -d '' action; do
         policy_paths+=("$path")
         policy_actions+=("$action")
     done < <(
-        jq -j '(.paths // {}) | to_entries[] | (.key + "\u0000" + .value + "\u0000")' "$config_file"
+        jq -j '
+            (.paths // {})
+            | to_entries[]
+            | (.key + "\u0000" + .value + "\u0000")
+        ' "$config_file"
     )
 
     mapfile -t unset_vars < <(
@@ -144,6 +147,8 @@ fi
 resolve_policy_path() {
     local path="$1"
     local variable
+    local parent
+    local name
 
     while IFS= read -r variable; do
         [[ -v "$variable" ]] ||
@@ -165,10 +170,23 @@ resolve_policy_path() {
         path="$workdir/$path"
     fi
 
-    path="$(realpath -m -- "$path")"
+    # First normalize lexical components without following symlinks.
+    path="$(realpath -m -s -- "$path")"
 
     [[ "$path" != "/" ]] ||
         die "refusing to apply a path policy to the filesystem root"
+
+    # Resolve symlinks in parent components, but preserve the final component
+    # as the mount destination. Thus /var/run/socket becomes /run/socket,
+    # while a final-component symlink remains the named policy target.
+    parent="${path%/*}"
+    name="${path##*/}"
+
+    [[ -n "$parent" ]] ||
+        parent="/"
+
+    parent="$(realpath -m -- "$parent")"
+    path="${parent%/}/$name"
 
     printf '%s\n' "$path"
 }
@@ -206,17 +224,11 @@ bwrap_args+=(
     --bind "$sandbox_runtime" "$runtime_root"
 )
 
-# Apply path policies from the configuration. Paths are mounted from
-# shortest to longest so that parent mounts are established before child
-# mounts inside them; for nested destinations the most specific (deepest)
-# path wins. The same resolved path with the same action is a redundant
-# no-op; conflicting actions for the same resolved path are a configuration
-# error.
 apply_path_policies() {
-    local -a resolved_paths
-    local -a resolved_actions
-    local -A seen_actions
-    local -a sorted_indices
+    local -a resolved_paths=()
+    local -a resolved_actions=()
+    local -A seen_actions=()
+    local -a sorted_indices=()
     local -i i
     local idx
     local path
@@ -226,12 +238,6 @@ apply_path_policies() {
     local overlay_upper
     local overlay_work
 
-    # Resolve every policy path. Byte-identical duplicate keys in the JSON
-    # object are collapsed by jq; this check catches paths written
-    # differently that resolve to the same destination (e.g. "~/x" vs
-    # "/home/user/x"). The same resolved path with the same action is a
-    # redundant no-op and is kept once; conflicting actions for the same
-    # resolved path are a configuration error.
     for ((i = 0; i < ${#policy_paths[@]}; i++)); do
         path="$(resolve_policy_path "${policy_paths[i]}")"
         action="${policy_actions[i]}"
@@ -241,20 +247,21 @@ apply_path_policies() {
                 die "conflicting path policies for $path: ${seen_actions[$path]} vs $action"
             continue
         fi
-        seen_actions["$path"]="$action"
 
+        seen_actions["$path"]="$action"
         resolved_paths+=("$path")
         resolved_actions+=("$action")
     done
 
-    # Order mounts from shortest to longest path so parent mounts precede
-    # child mounts; ties keep their configuration order.
+    # Parent destinations are mounted before children. Ties preserve config
+    # order, while deeper destinations naturally override parent mounts.
     while IFS=$'\t' read -r _ idx; do
         sorted_indices+=("$idx")
     done < <(
         for ((i = 0; i < ${#resolved_paths[@]}; i++)); do
             printf '%d\t%d\n' "${#resolved_paths[i]}" "$i"
-        done | sort -n -k1,1 -k2,2
+        done |
+            sort -n -k1,1 -k2,2
     )
 
     for idx in "${sorted_indices[@]}"; do
@@ -313,8 +320,6 @@ apply_path_policies() {
     done
 }
 
-# Paths are mounted from shortest to longest; the most specific (deepest)
-# path wins for nested destinations.
 apply_path_policies
 
 for name in "${unset_vars[@]}"; do
