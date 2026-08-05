@@ -1,4 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Fixed interpreter path: bash itself is part of the pre-sandbox trust chain,
+# and `#!/usr/bin/env bash` would resolve it through an untrusted PATH.
 
 set -euo pipefail
 umask 077
@@ -8,28 +10,68 @@ die() {
     exit 1
 }
 
-require() {
-    command -v "$1" >/dev/null 2>&1 ||
-        die "$1 is not installed"
-}
-
-for dependency in \
-    bwrap \
-    envsubst \
-    flock \
-    jq \
-    realpath \
-    sha256sum
-do
-    require "$dependency"
-done
-
 (($# > 0)) ||
     die "no command specified"
 
 [[ -n "${HOME:-}" ]] ||
     die "HOME is not set"
 
+# The writable working directory must be known before tools can be resolved:
+# a tool located inside it would be attacker-visible before the sandbox
+# starts. Resolve the toolchain immediately, before any XDG_RUNTIME_DIR
+# handling or state-path computation.
+workdir="$(pwd -P)"
+
+# Make ${PWD} in path policies refer to the physical invocation directory.
+export PWD="$workdir"
+
+# Resolve every tool the wrapper runs before exec'ing bwrap to a canonical
+# absolute path and refuse tools located inside the writable working
+# directory. All later invocations use the resolved paths, never the PATH.
+declare -A tools
+
+resolve_tool() {
+    local tool="$1"
+    local path
+
+    path="$(command -v "$tool")" ||
+        die "$tool is not installed"
+
+    # realpath is resolved by this very loop; use the plain command here.
+    path="$(realpath "$path")" ||
+        die "cannot resolve $tool: $path"
+
+    case "$path" in
+        "$workdir"|"$workdir"/*)
+            die "refusing to use $tool from the working directory: $path"
+            ;;
+    esac
+
+    tools["$tool"]="$path"
+}
+
+# bash is part of the pre-sandbox trust chain: the fixed #!/bin/bash shebang
+# covers the normal launch path, but if the script is ever invoked via
+# `bash ./simple-sandbox`, a workdir-resident bash must be refused too.
+for tool in \
+    bash \
+    bwrap \
+    envsubst \
+    flock \
+    jq \
+    realpath \
+    sha256sum \
+    grep \
+    cut \
+    sort \
+    mkdir \
+    chmod
+do
+    resolve_tool "$tool"
+done
+
+# XDG_RUNTIME_DIR must be set to an existing, writable directory. These
+# checks use only bash builtins, so they can run before any resolved tool.
 [[ -n "${XDG_RUNTIME_DIR:-}" ]] ||
     die "XDG_RUNTIME_DIR is not set"
 
@@ -39,29 +81,16 @@ done
 [[ -w "$XDG_RUNTIME_DIR" ]] ||
     die "XDG_RUNTIME_DIR is not writable: $XDG_RUNTIME_DIR"
 
-workdir="$(pwd -P)"
-home_root="$(realpath "$HOME")"
-runtime_root="$(realpath "$XDG_RUNTIME_DIR")"
+home_root="$("${tools[realpath]}" "$HOME")"
+runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")"
 
-# Make ${PWD} in path policies refer to the physical invocation directory.
-export PWD="$workdir"
-
-bwrap_path="$(command -v bwrap)"
-bwrap_path="$(realpath "$bwrap_path")"
-
-case "$bwrap_path" in
-    "$workdir"|"$workdir"/*)
-        die "refusing to use bubblewrap from the working directory: $bwrap_path"
-        ;;
-esac
-
-"$bwrap_path" --help 2>&1 | grep -q -- '--overlay-src' ||
+"${tools[bwrap]}" --help 2>&1 | "${tools[grep]}" -q -- '--overlay-src' ||
     die "installed bubblewrap does not support persistent overlays"
 
 sandbox_id="$(
     printf '%s' "$workdir" |
-        sha256sum |
-        cut -d' ' -f1
+        "${tools[sha256sum]}" |
+        "${tools[cut]}" -d' ' -f1
 )"
 
 sandbox_root="$runtime_root/simple-sandbox/$sandbox_id"
@@ -71,13 +100,13 @@ sandbox_runtime="$sandbox_root/runtime"
 overlays_root="$sandbox_root/overlays"
 lock_file="$sandbox_root/lock"
 
-mkdir -p \
+"${tools[mkdir]}" -p \
     "$home_upper" \
     "$home_work" \
     "$sandbox_runtime" \
     "$overlays_root"
 
-chmod 700 \
+"${tools[chmod]}" 700 \
     "$sandbox_root" \
     "$home_upper" \
     "$home_work" \
@@ -85,7 +114,7 @@ chmod 700 \
     "$overlays_root"
 
 if [[ -n "${SIMPLE_SANDBOX_CONFIG:-}" ]]; then
-    config_file="$(realpath -m -- "$SIMPLE_SANDBOX_CONFIG")"
+    config_file="$("${tools[realpath]}" -m -- "$SIMPLE_SANDBOX_CONFIG")"
 
     [[ -f "$config_file" ]] ||
         die "configuration file does not exist: $config_file"
@@ -101,7 +130,7 @@ policy_actions=()
 unset_vars=()
 
 if [[ -n "$config_file" ]]; then
-    jq -e '
+    "${tools[jq]}" -e '
         type == "object"
         and ((keys - ["paths", "unset"]) | length == 0)
 
@@ -132,7 +161,7 @@ if [[ -n "$config_file" ]]; then
         policy_paths+=("$path")
         policy_actions+=("$action")
     done < <(
-        jq -j '
+        "${tools[jq]}" -j '
             (.paths // {})
             | to_entries[]
             | (.key + "\u0000" + .value + "\u0000")
@@ -140,7 +169,7 @@ if [[ -n "$config_file" ]]; then
     )
 
     mapfile -t unset_vars < <(
-        jq -r '.unset // [] | .[]' "$config_file"
+        "${tools[jq]}" -r '.unset // [] | .[]' "$config_file"
     )
 fi
 
@@ -153,9 +182,9 @@ resolve_policy_path() {
     while IFS= read -r variable; do
         [[ -v "$variable" ]] ||
             die "unknown variable in path: $variable"
-    done < <(envsubst --variables "$path")
+    done < <("${tools[envsubst]}" --variables "$path")
 
-    path="$(printf '%s\n' "$path" | envsubst)"
+    path="$(printf '%s\n' "$path" | "${tools[envsubst]}")"
 
     case "$path" in
         "~")
@@ -171,7 +200,7 @@ resolve_policy_path() {
     fi
 
     # First normalize lexical components without following symlinks.
-    path="$(realpath -m -s -- "$path")"
+    path="$("${tools[realpath]}" -m -s -- "$path")"
 
     [[ "$path" != "/" ]] ||
         die "refusing to apply a path policy to the filesystem root"
@@ -185,7 +214,7 @@ resolve_policy_path() {
     [[ -n "$parent" ]] ||
         parent="/"
 
-    parent="$(realpath -m -- "$parent")"
+    parent="$("${tools[realpath]}" -m -- "$parent")"
     path="${parent%/}/$name"
 
     printf '%s\n' "$path"
@@ -261,7 +290,7 @@ apply_path_policies() {
         for ((i = 0; i < ${#resolved_paths[@]}; i++)); do
             printf '%d\t%d\n' "${#resolved_paths[i]}" "$i"
         done |
-            sort -n -k1,1 -k2,2
+            "${tools[sort]}" -n -k1,1 -k2,2
     )
 
     for idx in "${sorted_indices[@]}"; do
@@ -291,19 +320,19 @@ apply_path_policies() {
 
                 overlay_id="$(
                     printf '%s' "$path" |
-                        sha256sum |
-                        cut -d' ' -f1
+                        "${tools[sha256sum]}" |
+                        "${tools[cut]}" -d' ' -f1
                 )"
 
                 overlay_root="$overlays_root/$overlay_id"
                 overlay_upper="$overlay_root/upper"
                 overlay_work="$overlay_root/work"
 
-                mkdir -p \
+                "${tools[mkdir]}" -p \
                     "$overlay_upper" \
                     "$overlay_work"
 
-                chmod 700 \
+                "${tools[chmod]}" 700 \
                     "$overlay_root" \
                     "$overlay_upper" \
                     "$overlay_work"
@@ -336,6 +365,6 @@ bwrap_args+=(
 
 # One upper/work pair cannot safely back concurrent overlay mounts.
 exec 9>"$lock_file"
-flock -x 9
+"${tools[flock]}" -x 9
 
-exec "$bwrap_path" "${bwrap_args[@]}"
+exec "${tools[bwrap]}" "${bwrap_args[@]}"
