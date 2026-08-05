@@ -15,25 +15,29 @@
 - **Writable working directory** — the current working directory remains writable inside the sandbox. When it is `$HOME` itself, writes go to the `$HOME` overlay rather than directly to the host directory.
 - **Per-runtime `HOME` overlay** — overlayfs keeps the host `$HOME` read-only to the sandbox while changes accumulate in a private upper layer for as long as its `XDG_RUNTIME_DIR` instance exists.
 - **Configurable path policies** — `hide`, `readonly`, `expose` and `overlay` per-path rules via a JSON config file.
-- **Environment sanitization** — canonical `TMPDIR`/`XDG_RUNTIME_DIR` plus a configurable `unset` list for sensitive variables.
+- **Environment sanitization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME` plus a configurable `unset` list for sensitive variables.
 - **Concurrency-safe** — per-instance `flock` serializes overlay mounts so parallel invocations cannot corrupt shared upper/work layers.
-- **Security hardening** — strict validation of the config and policy paths, refusal to apply policies to `/`, refusal to use a `bwrap` from the working directory, and tight `0700` permissions on all private state.
-- **Zero privileges** — everything runs as the invoking user; no root, no SETUID.
+- **Security hardening** — every tool the wrapper runs (including `bash`, pinned via the fixed `#!/bin/bash` shebang) is resolved to a canonical absolute path before use and refused if it lives inside the writable working directory; a setuid `bwrap` is refused; `$HOME` inside the sandbox is the canonical home path; `XDG_RUNTIME_DIR` must be owned by the user, not group/other-writable, and the state path must not be a symlink; strict validation of the config and policy paths, refusal to apply policies to `/`, and tight `0700` permissions on all private state.
+- **Zero privileges** — everything runs as the invoking user; no root, no SETUID (the `bwrap` binary actually used is verified to be non-setuid).
 
 ---
 
 ## Requirements
 
-`simple-sandbox` verifies each dependency at startup and aborts with a clear message if any is missing.
+`simple-sandbox` resolves every tool it runs to a canonical absolute path at startup and aborts with a clear message if any is missing or lives inside the writable working directory. `bash` itself is pinned through the fixed `#!/bin/bash` shebang rather than `#!/usr/bin/env bash`, so it is never resolved through a launcher `PATH`.
 
 | Dependency   | Purpose                                                              |
 |--------------|----------------------------------------------------------------------|
-| `bwrap`      | The sandbox engine; **must** support `--overlay-src` (persistent overlays). |
-| `envsubst`   | Expands `${VAR}` in configuration paths.                            |
-| `flock`      | Serializes concurrent overlay mounts (concurrency safety).         |
-| `jq`         | Parses and strictly validates the JSON config file.                |
-| `realpath`   | Canonicalizes paths and resolves policy mount destinations.        |
-| `sha256sum`  | Derives sandbox instance IDs and overlay IDs from paths.           |
+| `bash`       | The interpreter; pinned via `#!/bin/bash`.                           |
+| `bwrap`      | The sandbox engine; **must** support `--overlay-src` (persistent overlays) and **must not** be setuid. |
+| `envsubst`   | Expands `${VAR}` in configuration paths.                             |
+| `flock`      | Serializes concurrent overlay mounts (concurrency safety).           |
+| `jq`         | Parses and strictly validates the JSON config file.                  |
+| `realpath`   | Canonicalizes paths and resolves policy mount destinations.          |
+| `sha256sum`  | Derives sandbox instance IDs and overlay IDs from paths.             |
+| `grep`, `cut`, `sort` | Filters `bwrap --help`, splits hash output, orders policy mounts. |
+| `mkdir`, `chmod` | Creates private state with `0700` permissions.                   |
+| `stat`       | Verifies `XDG_RUNTIME_DIR` has no group/other write bits.           |
 
 > **Note:** `bwrap` itself needs kernel support for user namespaces (`kernel.unprivileged_userns_clone`, typically enabled by default).
 
@@ -151,12 +155,12 @@ Sanitize the environment by removing listed variable names with `--unsetenv`. Ea
 
 Lifecycle:
 
-1. **Validate** — checks all dependencies, `HOME`, `XDG_RUNTIME_DIR` (exists/writable), command presence, and that `bwrap` supports persistent overlays and does not come from the working directory.
-2. **Derive state** — `sandbox_id = sha256(workdir)`; creates and `chmod 700`s the instance under `$XDG_RUNTIME_DIR/simple-sandbox/`.
+1. **Validate** — checks `HOME`, `XDG_RUNTIME_DIR` (exists/writable, owned by the user, not a symlink, no group/other write bits), command presence, then resolves every tool to a canonical absolute path, refusing tools from the working directory and refusing a setuid `bwrap`; verifies `bwrap` supports persistent overlays.
+2. **Derive state** — `sandbox_id = sha256(workdir)`; refuses symlinked state paths, then creates and `chmod 700`s the instance under `$XDG_RUNTIME_DIR/simple-sandbox/`.
 3. **Parse config** (`paths` + `unset`), resolve each policy path and sort parents before children.
 4. **Build args** — a read-only root, `--proc`, `--dev`, a `$HOME` overlay, and a writable view of the working directory. The order is adjusted when the working directory is `$HOME` or an ancestor of it.
 5. **Apply policies** — `hide`/`readonly`/`expose`/`overlay` and `--unsetenv` for the sanitized variables.
-6. **Set env** — `TMPDIR=/tmp`, `XDG_RUNTIME_DIR` remapped to the per-instance `runtime/` dir, and `--chdir` to the working directory.
+6. **Set env** — `TMPDIR=/tmp`, `XDG_RUNTIME_DIR` remapped to the per-instance `runtime/` dir, canonical `HOME`, and `--chdir` to the working directory.
 7. **Lock & exec** — take the instance `flock`, then `exec bwrap`.
 
 ---
