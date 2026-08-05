@@ -70,6 +70,12 @@ do
     resolve_tool "$tool"
 done
 
+# A setuid bwrap would escalate privileges outside the sandbox contract;
+# the resolver must have refused a workdir-resident binary already, and an
+# installed setuid binary is refused here.
+[[ ! -u "${tools[bwrap]}" ]] ||
+    die "refusing setuid bubblewrap: ${tools[bwrap]}"
+
 # XDG_RUNTIME_DIR must be set to an existing, writable directory. These
 # checks use only bash builtins, so they can run before any resolved tool.
 [[ -n "${XDG_RUNTIME_DIR:-}" ]] ||
