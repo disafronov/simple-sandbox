@@ -1,45 +1,62 @@
 # simple-sandbox
 
-**Lightweight, non-root Linux sandboxing via bubblewrap.** A single Bash script that builds a namespace-isolated environment for arbitrary commands without requiring root privileges or a dedicated daemon.
+**Lightweight, non-root, filesystem-focused Linux sandboxing via bubblewrap.**
 
-`simple-sandbox` is a thin wrapper around [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). It assembles a minimal execution context — a read-only host filesystem, fresh `/proc` and `/dev`, private `/tmp`, and an overlay-based `$HOME` — and runs your command inside it.
+`simple-sandbox` is a thin wrapper around [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). It builds a minimal execution environment with a read-only host filesystem, fresh `/proc` and `/dev`, a private `/tmp`, and an overlay-based `$HOME`, then runs an arbitrary command inside it.
+
+## Default contract
+
+Without any configuration, `simple-sandbox` provides:
+
+- A **read-only** view of the host filesystem.
+- A **writable invocation working directory**.
+- A **private writable overlay for `$HOME`**.
+- Fresh `/proc` and `/dev`.
+- A private `/tmp`.
+- The **host network unchanged**.
+
+Configuration is optional and exists only to extend this baseline with path-specific policies and environment filtering.
 
 ---
 
 ## Features
 
 - **Namespace isolation** — separate PID, mount, IPC, UTS and user namespaces (`--unshare-all`) with `--die-with-parent` so nothing outlives the caller.
-- **Read-only host filesystem** — `/` is bound read-only; the sandbox cannot modify the host tree.
-- **Fresh `/proc` and `/dev`** — clean device and process namespaces with no access to host procs or devices.
-- **Private `/tmp`** — a fresh tmpfs, plus `TMPDIR=/tmp` for predictable temp behavior.
-- **Writable working directory** — the current working directory remains writable inside the sandbox. When it is `$HOME` itself, writes go to the `$HOME` overlay rather than directly to the host directory.
-- **Per-runtime `HOME` overlay** — overlayfs keeps the host `$HOME` read-only to the sandbox while changes accumulate in a private upper layer for as long as its `XDG_RUNTIME_DIR` instance exists.
-- **Configurable path policies** — `hide`, `readonly`, `expose` and `overlay` per-path rules via a JSON config file.
-- **Environment sanitization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME` plus a configurable `unset` list for sensitive variables.
-- **Concurrency-safe** — per-instance `flock` serializes overlay mounts so parallel invocations cannot corrupt shared upper/work layers.
-- **Security hardening** — every tool the wrapper runs (including `bash`, pinned via the fixed `#!/bin/bash` shebang) is resolved to a canonical absolute path before use and refused if it lives inside the writable working directory; a setuid `bwrap` is refused; `$HOME` inside the sandbox is the canonical home path; `XDG_RUNTIME_DIR` must be owned by the user, not group/other-writable, and the state path must not be a symlink; strict validation of the config and policy paths, refusal to apply policies to `/`, and tight `0700` permissions on all private state.
-- **Zero privileges** — everything runs as the invoking user; no root, no SETUID (the `bwrap` binary actually used is verified to be non-setuid).
+- **Read-only host filesystem** — `/` is mounted read-only by default. Only the working directory and paths explicitly exposed by policy may modify the host filesystem.
+- **Fresh `/proc` and minimal `/dev`** — the sandbox gets its own procfs and a newly created minimal device tree instead of the host mounts.
+- **Private `/tmp`** — a fresh tmpfs, plus `TMPDIR=/tmp` for predictable temporary-file behavior.
+- **Writable working directory** — the invocation working directory is bind-mounted read-write from the host. When it is `$HOME` itself, writes are redirected into the `$HOME` overlay instead of the host directory.
+- **Per-runtime `$HOME` overlay** — overlayfs keeps the host `$HOME` read-only while sandbox changes accumulate in a private upper layer for the lifetime of the corresponding `XDG_RUNTIME_DIR` instance.
+- **Configurable path policies** — optional `hide`, `readonly`, `expose` and `overlay` rules for individual paths.
+- **Environment normalization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME`, plus an optional `unset` list for sensitive environment variables.
+- **Concurrency-safe** — per-instance `flock` serializes overlay mounts so concurrent invocations cannot corrupt shared overlay state.
+- **Trusted launcher** — every external tool the wrapper invokes is resolved to a canonical absolute path and rejected if it resides inside the writable working directory. `bash` is pinned via the fixed `#!/bin/bash` shebang and is never resolved through `PATH`.
+- **Runtime validation** — refuses a setuid `bwrap`; verifies persistent overlay support; validates `XDG_RUNTIME_DIR` ownership and permissions; refuses symlinked state paths; creates private runtime state with `0700` permissions.
+- **Strict policy validation** — configuration is strictly validated; invalid paths, conflicting rules, attempts to apply policies to `/`, and malformed environment variable names abort startup.
+- **Zero privileges** — everything runs as the invoking user. No root privileges and no setuid `bwrap`.
 
 ---
 
 ## Requirements
 
-`simple-sandbox` resolves every tool it runs to a canonical absolute path at startup and aborts with a clear message if any is missing or lives inside the writable working directory. `bash` itself is pinned through the fixed `#!/bin/bash` shebang rather than `#!/usr/bin/env bash`, so it is never resolved through a launcher `PATH`.
+`simple-sandbox` resolves every external tool it invokes to a canonical absolute path during startup and aborts if any required dependency is missing or resides inside the writable working directory.
 
-| Dependency   | Purpose                                                              |
-|--------------|----------------------------------------------------------------------|
-| `bash`       | The interpreter; pinned via `#!/bin/bash`.                           |
-| `bwrap`      | The sandbox engine; **must** support `--overlay-src` (persistent overlays) and **must not** be setuid. |
-| `envsubst`   | Expands `${VAR}` in configuration paths.                             |
-| `flock`      | Serializes concurrent overlay mounts (concurrency safety).           |
-| `jq`         | Parses and strictly validates the JSON config file.                  |
-| `realpath`   | Canonicalizes paths and resolves policy mount destinations.          |
-| `sha256sum`  | Derives sandbox instance IDs and overlay IDs from paths.             |
-| `grep`, `cut`, `sort` | Filters `bwrap --help`, splits hash output, orders policy mounts. |
-| `mkdir`, `chmod` | Creates private state with `0700` permissions.                   |
-| `stat`       | Verifies `XDG_RUNTIME_DIR` has no group/other write bits.           |
+`bash` itself is pinned through the fixed `#!/bin/bash` shebang rather than `#!/usr/bin/env bash`, so it is never resolved through a launcher `PATH`.
 
-> **Note:** `bwrap` itself needs kernel support for user namespaces (`kernel.unprivileged_userns_clone`, typically enabled by default).
+| Dependency | Purpose |
+|------------|---------|
+| `bash` | The interpreter; pinned via `#!/bin/bash`. |
+| `bwrap` | Sandbox engine; **must** support `--overlay-src` and **must not** be setuid. |
+| `envsubst` | Expands `${VAR}` in configuration paths. |
+| `flock` | Serializes concurrent overlay mounts. |
+| `jq` | Parses and strictly validates the JSON configuration. |
+| `realpath` | Canonicalizes paths and resolves policy destinations. |
+| `sha256sum` | Derives sandbox instance and overlay identifiers. |
+| `grep`, `cut`, `sort` | Detect features, split hashes and order policy mounts. |
+| `mkdir`, `chmod` | Creates private runtime state with `0700` permissions. |
+| `stat` | Verifies `XDG_RUNTIME_DIR` permissions. |
+
+> **Note:** `bwrap` requires Linux user namespaces (typically enabled by default via `kernel.unprivileged_userns_clone`).
 
 ---
 
@@ -53,95 +70,160 @@ cd simple-sandbox
 chmod +x simple-sandbox
 ```
 
-The script has no build step or runtime dependencies besides those listed above. Copy the executable wherever you like, e.g.:
+Install anywhere in your `PATH`, for example:
 
 ```bash
 install -m 0755 simple-sandbox ~/.local/bin/simple-sandbox
 ```
 
+No build step is required.
+
+---
+
 ## Usage
 
-```
+```text
 simple-sandbox command [args...]
 ```
 
-`simple-sandbox` takes a single positional command line: everything after the script name is the command and its arguments to run inside the sandbox. The invocation directory becomes the writable working directory.
+`simple-sandbox` accepts a command followed by its arguments.
 
-Nothing after the command is parsed by `simple-sandbox`; if the command itself has options they are passed through to the sandbox unchanged. All positional arguments are passed directly to `bwrap` as the command and its arguments. The script inserts bwrap's `--` option-separator automatically, so you do **not** need to (and should not) pass `--` yourself.
+The current working directory becomes the writable project directory inside the sandbox.
+
+The wrapper does **not** interpret the command's arguments as its own options. They are forwarded unchanged to the executed command after Bubblewrap's `--` separator.
+
+Examples:
 
 ```bash
 # Interactive shell
-./simple-sandbox bash
+simple-sandbox bash
 
 # Build in the current directory
-./simple-sandbox make test
+simple-sandbox make test
 
-# Run a Python script; the host filesystem is read-only by default
-./simple-sandbox python3 ./tool.py
+# Run a Python script
+simple-sandbox python3 ./tool.py
 ```
 
-### Operating point
+---
 
-The sandbox is identified by a **SHA‑256 digest of the invocation working directory** (the physical `pwd -P`). Its state — the `$HOME` overlay, per-path overlays and the private runtime directory — lives under a single instance root:
+## Operating point
 
-```
+Persistent runtime state is keyed by the **SHA-256 digest of the physical invocation working directory** (`pwd -P`).
+
+Each working directory receives its own runtime instance under:
+
+```text
 $XDG_RUNTIME_DIR/simple-sandbox/<sha256(workdir)>/
 ```
 
-| Path                        | Purpose |
-|-----------------------------|---------|
-| `home-upper/`               | Writable upper layer for the `$HOME` overlayfs. |
-| `home-work/`                | Work directory required by the `$HOME` overlay mount. |
-| `runtime/`                  | Bound onto `$XDG_RUNTIME_DIR` inside the sandbox. |
-| `overlays/<id>/upper,work`  | Upper and work directories for an `overlay` policy. |
-| `lock`                      | `flock` guard held for the sandbox process lifetime. |
+| Path | Purpose |
+|------|---------|
+| `home-upper/` | Writable upper layer for the `$HOME` overlay. |
+| `home-work/` | Overlay work directory. |
+| `runtime/` | Bound onto `XDG_RUNTIME_DIR` inside the sandbox. |
+| `overlays/<id>/upper,work` | Runtime state for `overlay` path policies. |
+| `lock` | Lifetime `flock` protecting concurrent access. |
 
-State is reused by later invocations from the same physical working directory, but it is not durable storage: `XDG_RUNTIME_DIR` is normally cleaned up when the user session ends.
+State is reused by later invocations from the same physical working directory.
 
-The environment variable `$SIMPLE_SANDBOX_CONFIG` points to a custom JSON configuration **file**; see [Configuration](#configuration). When unset, the config defaults to `${XDG_CONFIG_HOME:-~/.config}/simple-sandbox.json` (skipped if missing).
+It is **not durable storage**. Runtime state normally disappears when `XDG_RUNTIME_DIR` is cleaned up at session end.
+
+The optional configuration file is specified via:
+
+```text
+SIMPLE_SANDBOX_CONFIG
+```
+
+When unset, the default path is:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/simple-sandbox.json
+```
+
+Missing configuration files are silently ignored.
 
 ---
 
 ## Configuration
 
-If a config file exists, `simple-sandbox` reads a JSON document that may contain only the `paths` object and the `unset` array; either key may be omitted. The document is strictly validated with `jq` and the launch is aborted on any violation.
+Configuration is entirely optional.
+
+If present, the JSON document may contain:
+
+- `paths`
+- `unset`
+
+No other top-level keys are accepted.
+
+Example:
 
 ```json
 {
   "paths": {
-    "/home/user/secret": "hide",
-    "/etc/passwd": "expose",
-    "/var/log": "readonly",
-    "/home/user/projects": "overlay"
+    "~/.ssh": "hide",
+    "~/.config/my-tool": "readonly",
+    "/var/tmp/project-cache": "expose",
+    "~/.cache/build": "overlay"
   },
-  "unset": ["AWS_SECRET_ACCESS_KEY", "PRIVATE_TOKEN"]
+  "unset": [
+    "AWS_SECRET_ACCESS_KEY",
+    "PRIVATE_TOKEN"
+  ]
 }
 ```
 
-### `paths` — path policies
+### `paths`
 
-Keys may be absolute or relative paths, may contain `${VAR}` environment expansions and `~` for the home directory, and are resolved relative to the working directory when they are not absolute. Referenced variables must exist in the launcher environment. The **final path component is preserved** while symlinks in parent components are resolved.
+Each key may be:
 
-| Policy      | Meaning                                                            |
-|-------------|--------------------------------------------------------------------|
-| `hide`      | Dir → `--tmpfs`; file → read-only bind of `/dev/null` (an empty file). |
-| `readonly`  | Re-mount the path read-only with `--ro-bind`.                       |
-| `expose`    | RW bind-mount the host path into the sandbox.                       |
-| `overlay`   | Per-runtime overlay of a host directory with a private upper layer. |
+- absolute;
+- relative to the working directory;
+- contain `${VAR}`;
+- use `~` for the user's home directory.
 
-`overlay` requires the path to be a directory. Policies for the filesystem root are refused. Duplicate policies for the same resolved path are deduplicated when their actions match; conflicting actions abort the launch. A policy whose target does not exist is skipped. Parent mounts precede child mounts so deeper destinations can override shallow ones.
+The final path component is preserved while symlinked parent directories are canonicalized.
 
-### `unset` — environment
+| Policy | Meaning |
+|--------|---------|
+| `hide` | Directory → `tmpfs`; file → read-only bind of `/dev/null`. |
+| `readonly` | Rebind read-only. |
+| `expose` | Read-write bind from the host. |
+| `overlay` | Runtime overlay with a private upper layer. |
 
-Sanitize the environment by removing listed variable names with `--unsetenv`. Each value must be a valid shell/sanitized variable name (`^[A-Za-z_][A-Za-z0-9_]*$`).
+`overlay` applies only to directories.
+
+Policies targeting `/` are rejected.
+
+Missing paths are skipped.
+
+Duplicate identical policies are merged.
+
+Conflicting policies abort startup.
+
+Parent paths are mounted before children so deeper paths can intentionally override broader ones.
+
+### `unset`
+
+Removes selected environment variables via `--unsetenv`.
+
+Each name must match:
+
+```text
+^[A-Za-z_][A-Za-z0-9_]*$
+```
 
 ---
 
 ## How it works
 
-`simple-sandbox` builds `bwrap` arguments and `exec`s it directly, so there is no lingering wrapper process. Its base mounts are:
+`simple-sandbox` builds the Bubblewrap command line and `exec`s it directly.
 
-```
+The wrapper process does not remain after launch.
+
+Base mounts:
+
+```text
 --die-with-parent
 --unshare-all
 --share-net
@@ -153,21 +235,22 @@ Sanitize the environment by removing listed variable names with `--unsetenv`. Ea
 --tmpfs /tmp
 ```
 
-Lifecycle:
+Launch sequence:
 
-1. **Validate** — checks `HOME`, `XDG_RUNTIME_DIR` (exists/writable, owned by the user, not a symlink, no group/other write bits), command presence, then resolves every tool to a canonical absolute path, refusing tools from the working directory and refusing a setuid `bwrap`; verifies `bwrap` supports persistent overlays.
-2. **Derive state** — `sandbox_id = sha256(workdir)`; refuses symlinked state paths, then creates and `chmod 700`s the instance under `$XDG_RUNTIME_DIR/simple-sandbox/`.
-3. **Parse config** (`paths` + `unset`), resolve each policy path and sort parents before children.
-4. **Build args** — a read-only root, `--proc`, `--dev`, a `$HOME` overlay, and a writable view of the working directory. The order is adjusted when the working directory is `$HOME` or an ancestor of it.
-5. **Apply policies** — `hide`/`readonly`/`expose`/`overlay` and `--unsetenv` for the sanitized variables.
-6. **Set env** — `TMPDIR=/tmp`, `XDG_RUNTIME_DIR` remapped to the per-instance `runtime/` dir, canonical `HOME`, and `--chdir` to the working directory.
-7. **Lock & exec** — take the instance `flock`, then `exec bwrap`.
+1. Validate the runtime environment and dependencies.
+2. Resolve every external tool to a canonical absolute path.
+3. Create or reuse the runtime instance under `XDG_RUNTIME_DIR`.
+4. Parse and validate the optional configuration.
+5. Build the base Bubblewrap mount layout.
+6. Apply path policies and environment filtering.
+7. Acquire the instance lock.
+8. `exec bwrap`.
 
 ---
 
 ## Limitations
 
-- **The host filesystem is readable by default** — `--ro-bind / /` prevents writes, but does not hide host files. Use `hide` policies for secrets and other paths a command must not read.
-- **No network isolation** — `--share-net` is intentional; the sandbox shares the host network namespace.
-- **No syscall filtering** — nothing like seccomp is applied; isolation relies entirely on bubblewrap's namespace/mount model.
-- **State is session-scoped** — overlays live in `XDG_RUNTIME_DIR` and normally disappear at session cleanup. The per-instance lock protects concurrent invocations of one user and working directory; it is not a multi-user store.
+- **The host filesystem is readable by default.** Only writes are restricted. Use `hide` policies for paths that must not be visible.
+- **The host network is shared.** No network namespace isolation is performed.
+- **No syscall filtering.** No seccomp or similar syscall restrictions are applied.
+- **Runtime state is ephemeral.** Overlay state is intended for temporary execution state, not persistent storage.
