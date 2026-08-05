@@ -65,7 +65,8 @@ for tool in \
     cut \
     sort \
     mkdir \
-    chmod
+    chmod \
+    stat
 do
     resolve_tool "$tool"
 done
@@ -87,6 +88,19 @@ done
 [[ -w "$XDG_RUNTIME_DIR" ]] ||
     die "XDG_RUNTIME_DIR is not writable: $XDG_RUNTIME_DIR"
 
+# The directory must not be a symlink (a link could point outside the
+# intended runtime root) and must be owned by the current user with no
+# group/other write bits: a writable XDG_RUNTIME_DIR is a privilege
+# boundary, and a shared one would let other users influence the sandbox.
+[[ ! -L "$XDG_RUNTIME_DIR" ]] ||
+    die "XDG_RUNTIME_DIR must not be a symlink"
+[[ -O "$XDG_RUNTIME_DIR" ]] ||
+    die "XDG_RUNTIME_DIR is not owned by the current user"
+runtime_mode="$("${tools[stat]}" -c %a "$XDG_RUNTIME_DIR")" ||
+    die "cannot stat XDG_RUNTIME_DIR"
+(( (8#$runtime_mode & 8#022) == 0 )) ||
+    die "XDG_RUNTIME_DIR must not be group or world writable"
+
 home_root="$("${tools[realpath]}" "$HOME")"
 runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")"
 
@@ -105,6 +119,11 @@ home_work="$sandbox_root/home-work"
 sandbox_runtime="$sandbox_root/runtime"
 overlays_root="$sandbox_root/overlays"
 lock_file="$sandbox_root/lock"
+
+[[ ! -L "$runtime_root/simple-sandbox" ]] ||
+    die "refusing symlink: $runtime_root/simple-sandbox"
+[[ ! -L "$sandbox_root" ]] ||
+    die "refusing symlink: $sandbox_root"
 
 "${tools[mkdir]}" -p \
     "$home_upper" \
