@@ -362,6 +362,9 @@ for name in "${unset_vars[@]}"; do
 done
 
 bwrap_args+=(
+    # Environment HOME must match the canonical overlay mount path so programs
+    # see one consistent home regardless of symlinks.
+    --setenv HOME "$home_root"
     --setenv TMPDIR /tmp
     --setenv XDG_RUNTIME_DIR "$runtime_root"
     --chdir "$workdir"
