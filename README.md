@@ -219,6 +219,16 @@ Example:
 
 The broader directory remains hidden while the `uv` subdirectory is explicitly exposed.
 
+### `unset`
+
+Removes selected environment variables via `--unsetenv`.
+
+Each name must match:
+
+```text
+^[A-Za-z_][A-Za-z0-9_]*$
+```
+
 ## Limitations
 
 - **The host filesystem is readable by default.** Only writes are restricted. Use `hide` policies for paths that must not be visible.
