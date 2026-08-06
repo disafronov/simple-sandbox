@@ -28,7 +28,8 @@ Configuration is optional and exists only to extend this baseline with path-spec
 - **Writable working directory** — the invocation working directory is bind-mounted read-write from the host. When it is `$HOME` itself, writes are redirected into the `$HOME` overlay instead of the host directory.
 - **Per-runtime `$HOME` overlay** — overlayfs keeps the host `$HOME` read-only while sandbox changes accumulate in a private upper layer for the lifetime of the corresponding `XDG_RUNTIME_DIR` instance.
 - **Configurable path policies** — optional `hide`, `readonly`, `expose` and `overlay` rules for individual paths.
-- **Environment normalization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME`, plus an optional `unset` list for sensitive environment variables.
+- **Hierarchical path policies** — parent paths are applied before child paths, allowing narrow exceptions inside broader rules without depending on configuration order.
+- **Environment sanitization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME`, plus an optional `unset` list for sensitive environment variables.
 - **Concurrency-safe** — per-instance `flock` serializes overlay mounts so concurrent invocations cannot corrupt shared overlay state.
 - **Trusted launcher** — every external tool the wrapper invokes is resolved to a canonical absolute path and rejected if it resides inside the writable working directory. `bash` is pinned via the fixed `#!/bin/bash` shebang and is never resolved through `PATH`.
 - **Runtime validation** — refuses a setuid `bwrap`; verifies persistent overlay support; validates `XDG_RUNTIME_DIR` ownership and permissions; refuses symlinked state paths; creates private runtime state with `0700` permissions.
@@ -195,62 +196,33 @@ The final path component is preserved while symlinked parent directories are can
 
 Policies targeting `/` are rejected.
 
-Missing paths are skipped.
+Missing filesystem paths are skipped.
+
+If a `${VAR}` reference expands an unset environment variable, the corresponding policy is skipped and a warning is written to standard error.
 
 Duplicate identical policies are merged.
 
 Conflicting policies abort startup.
 
-Parent paths are mounted before children so deeper paths can intentionally override broader ones.
+Parent paths are mounted before children so deeper paths can intentionally override broader ones. Configuration order is therefore irrelevant.
 
-### `unset`
+Example:
 
-Removes selected environment variables via `--unsetenv`.
-
-Each name must match:
-
-```text
-^[A-Za-z_][A-Za-z0-9_]*$
+```json
+{
+  "paths": {
+    "~/.local/share": "hide",
+    "~/.local/share/uv": "expose"
+  }
+}
 ```
 
----
-
-## How it works
-
-`simple-sandbox` builds the Bubblewrap command line and `exec`s it directly.
-
-The wrapper process does not remain after launch.
-
-Base mounts:
-
-```text
---die-with-parent
---unshare-all
---share-net
---ro-bind / /
---proc /proc
---dev /dev
---overlay-src $HOME --overlay home-upper home-work $HOME
---bind $workdir $workdir
---tmpfs /tmp
-```
-
-Launch sequence:
-
-1. Validate the runtime environment and dependencies.
-2. Resolve every external tool to a canonical absolute path.
-3. Create or reuse the runtime instance under `XDG_RUNTIME_DIR`.
-4. Parse and validate the optional configuration.
-5. Build the base Bubblewrap mount layout.
-6. Apply path policies and environment filtering.
-7. Acquire the instance lock.
-8. `exec bwrap`.
-
----
+The broader directory remains hidden while the `uv` subdirectory is explicitly exposed.
 
 ## Limitations
 
 - **The host filesystem is readable by default.** Only writes are restricted. Use `hide` policies for paths that must not be visible.
+- **Policies are explicit.** Paths remain readable unless hidden by policy.
 - **The host network is shared.** No network namespace isolation is performed.
 - **No syscall filtering.** No seccomp or similar syscall restrictions are applied.
 - **Runtime state is ephemeral.** Overlay state is intended for temporary execution state, not persistent storage.
