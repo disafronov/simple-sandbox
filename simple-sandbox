@@ -101,8 +101,10 @@ runtime_mode="$("${tools[stat]}" -c %a "$XDG_RUNTIME_DIR")" ||
 (( (8#$runtime_mode & 8#022) == 0 )) ||
     die "XDG_RUNTIME_DIR must not be group or world writable"
 
-home_root="$("${tools[realpath]}" "$HOME")"
-runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")"
+home_root="$("${tools[realpath]}" "$HOME")" ||
+    die "cannot resolve HOME: $HOME"
+runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")" ||
+    die "cannot resolve XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 
 "${tools[bwrap]}" --help 2>&1 | "${tools[grep]}" -q -- '--overlay-src' ||
     die "installed bubblewrap does not support persistent overlays"
@@ -139,7 +141,8 @@ lock_file="$sandbox_root/lock"
     "$overlays_root"
 
 if [[ -n "${SIMPLE_SANDBOX_CONFIG:-}" ]]; then
-    config_file="$("${tools[realpath]}" -m -- "$SIMPLE_SANDBOX_CONFIG")"
+    config_file="$("${tools[realpath]}" -m -- "$SIMPLE_SANDBOX_CONFIG")" ||
+        die "cannot resolve SIMPLE_SANDBOX_CONFIG: $SIMPLE_SANDBOX_CONFIG"
 
     [[ -f "$config_file" ]] ||
         die "configuration file does not exist: $config_file"
@@ -228,7 +231,8 @@ resolve_policy_path() {
     fi
 
     # First normalize lexical components without following symlinks.
-    path="$("${tools[realpath]}" -m -s -- "$path")"
+    path="$("${tools[realpath]}" -m -s -- "$path")" ||
+        die "cannot resolve policy path: $path"
 
     [[ "$path" != "/" ]] ||
         die "refusing to apply a path policy to the filesystem root"
@@ -242,7 +246,8 @@ resolve_policy_path() {
     [[ -n "$parent" ]] ||
         parent="/"
 
-    parent="$("${tools[realpath]}" -m -- "$parent")"
+    parent="$("${tools[realpath]}" -m -- "$parent")" ||
+        die "cannot resolve policy parent: $parent"
     path="${parent%/}/$name"
 
     printf '%s\n' "$path"
