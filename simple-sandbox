@@ -205,8 +205,11 @@ resolve_policy_path() {
     local name
 
     while IFS= read -r variable; do
-        [[ -v "$variable" ]] ||
-            die "unknown variable in path: $variable"
+        if [[ ! -v "$variable" ]]; then
+            printf 'warning: skipping path policy: %s is not set\n' \
+                "$variable" >&2
+            return 1
+        fi
     done < <("${tools[envsubst]}" --variables "$path")
 
     path="$(printf '%s\n' "$path" | "${tools[envsubst]}")"
@@ -293,7 +296,10 @@ apply_path_policies() {
     local overlay_work
 
     for ((i = 0; i < ${#policy_paths[@]}; i++)); do
-        path="$(resolve_policy_path "${policy_paths[i]}")"
+        if ! path="$(resolve_policy_path "${policy_paths[i]}")"; then
+            continue
+        fi
+
         action="${policy_actions[i]}"
 
         if [[ -v "seen_actions[$path]" ]]; then
