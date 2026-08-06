@@ -217,6 +217,7 @@ resolve_policy_path() {
 
     path="$(printf '%s\n' "$path" | "${tools[envsubst]}")"
 
+    # shellcheck disable=SC2088  # "~/" is a literal relative-prefix to resolve against $HOME; expansion would break the match
     case "$path" in
         "~")
             path="$HOME"
