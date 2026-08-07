@@ -22,6 +22,11 @@ die() {
 # handling or state-path computation.
 workdir="$(pwd -P)"
 
+# The filesystem root cannot be made writable (it is always bound read-only
+# into the sandbox), so it is not supported as a working directory.
+[[ "$workdir" != "/" ]] ||
+    die "the filesystem root cannot be made writable and is not supported as a working directory"
+
 # Make ${PWD} in path policies refer to the physical invocation directory.
 export PWD="$workdir"
 
@@ -103,6 +108,11 @@ runtime_mode="$("${tools[stat]}" -c %a "$XDG_RUNTIME_DIR")" ||
 
 home_root="$("${tools[realpath]}" "$HOME")" ||
     die "cannot resolve HOME: $HOME"
+
+# A HOME pointing at the filesystem root cannot be hidden behind a private
+# mount: binding over "/" would re-expose the whole host as the sandbox root.
+[[ "$home_root" != "/" ]] ||
+    die "a HOME pointing at the filesystem root cannot be sandboxed behind a private mount"
 runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")" ||
     die "cannot resolve XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 
@@ -116,8 +126,8 @@ sandbox_id="$(
 )"
 
 sandbox_root="$runtime_root/simple-sandbox/$sandbox_id"
-home_upper="$sandbox_root/home-upper"
-home_work="$sandbox_root/home-work"
+# Per-workdir private writable home used to hide the real one.
+private_home="$sandbox_root/home"
 sandbox_runtime="$sandbox_root/runtime"
 overlays_root="$sandbox_root/overlays"
 lock_file="$sandbox_root/lock"
@@ -128,15 +138,13 @@ lock_file="$sandbox_root/lock"
     die "refusing symlink: $sandbox_root"
 
 "${tools[mkdir]}" -p \
-    "$home_upper" \
-    "$home_work" \
+    "$private_home" \
     "$sandbox_runtime" \
     "$overlays_root"
 
 "${tools[chmod]}" 700 \
     "$sandbox_root" \
-    "$home_upper" \
-    "$home_work" \
+    "$private_home" \
     "$sandbox_runtime" \
     "$overlays_root"
 
@@ -211,7 +219,7 @@ resolve_policy_path() {
         if [[ ! -v "$variable" ]]; then
             printf 'warning: skipping path policy: %s is not set\n' \
                 "$variable" >&2
-            return 1
+            return 2
         fi
     done < <("${tools[envsubst]}" --variables "$path")
 
@@ -238,6 +246,12 @@ resolve_policy_path() {
     [[ "$path" != "/" ]] ||
         die "refusing to apply a path policy to the filesystem root"
 
+    # The private home is the default-deny boundary.  A policy targeting the
+    # home root itself would bind the real home back into the sandbox; allow
+    # only explicitly selected descendants.
+    [[ "$path" != "$home_root" ]] ||
+        die "refusing to apply a path policy to HOME itself"
+
     # Resolve symlinks in parent components, but preserve the final component
     # as the mount destination. Thus /var/run/socket becomes /run/socket,
     # while a final-component symlink remains the named policy target.
@@ -263,21 +277,21 @@ bwrap_args=(
     --dev /dev
 )
 
-if [[ "$workdir" == "$home_root" ]]; then
+# The private home is bound BEFORE any workdir or policy mount so that later
+# mount DESTINATIONS under ${home_root} resolve inside the private home, not
+# the real one (bwrap resolves mount sources in the host namespace,
+# destinations in the new one).
+bwrap_args+=(
+    --bind "$private_home" "$home_root"
+)
+
+# The working directory is always writable by design (writes land in the real
+# project); when workdir is inside the home, its destination resolves inside
+# the private home. When workdir EQUALS home_root, no extra bind is added (the
+# private home already provides the writable cwd and the real home must not be
+# re-exposed read-write).
+if [[ "$workdir" != "$home_root" ]]; then
     bwrap_args+=(
-        --overlay-src "$home_root"
-        --overlay "$home_upper" "$home_work" "$home_root"
-    )
-elif [[ "$workdir" == "/" || "$home_root" == "$workdir/"* ]]; then
-    bwrap_args+=(
-        --bind "$workdir" "$workdir"
-        --overlay-src "$home_root"
-        --overlay "$home_upper" "$home_work" "$home_root"
-    )
-else
-    bwrap_args+=(
-        --overlay-src "$home_root"
-        --overlay "$home_upper" "$home_work" "$home_root"
         --bind "$workdir" "$workdir"
     )
 fi
@@ -296,13 +310,24 @@ apply_path_policies() {
     local idx
     local path
     local action
+    local status
     local overlay_id
     local overlay_root
     local overlay_upper
     local overlay_work
 
     for ((i = 0; i < ${#policy_paths[@]}; i++)); do
-        if ! path="$(resolve_policy_path "${policy_paths[i]}")"; then
+        if path="$(resolve_policy_path "${policy_paths[i]}")"; then
+            :
+        else
+            status=$?
+            # An unset ${VAR} is the one intentionally skippable policy
+            # resolution failure.  All validation errors must abort startup.
+            [[ "$status" -eq 2 ]] && continue
+            return "$status"
+        fi
+
+        if [[ -z "$path" ]]; then
             continue
         fi
 
@@ -393,8 +418,8 @@ for name in "${unset_vars[@]}"; do
 done
 
 bwrap_args+=(
-    # Environment HOME must match the canonical overlay mount path so programs
-    # see one consistent home regardless of symlinks.
+    # Environment HOME must match the canonical private home mount path so
+    # programs see one consistent home regardless of symlinks.
     --setenv HOME "$home_root"
     --setenv TMPDIR /tmp
     --setenv XDG_RUNTIME_DIR "$runtime_root"
@@ -403,7 +428,9 @@ bwrap_args+=(
     "$@"
 )
 
-# One upper/work pair cannot safely back concurrent overlay mounts.
+# One upper/work pair cannot safely back concurrent overlay mounts, and the
+# shared private home dir is likewise serialized per workdir: the flock covers
+# concurrent sandboxes from the same workdir.
 exec 9>"$lock_file"
 "${tools[flock]}" -x 9
 
