@@ -110,12 +110,12 @@ simple-sandbox python3 ./tool.py
 
 ## Operating point
 
-Persistent runtime state is keyed by the **SHA-256 digest of the physical invocation working directory** (`pwd -P`).
+Persistent sandbox state is keyed by the **SHA-256 digest of the physical invocation working directory** (`pwd -P`).
 
 Each working directory receives its own runtime instance under:
 
 ```text
-$XDG_RUNTIME_DIR/simple-sandbox/<sha256(workdir)>/
+$XDG_STATE_HOME/simple-sandbox/<sha256(workdir)>/
 ```
 
 | Path | Purpose |
@@ -127,7 +127,13 @@ $XDG_RUNTIME_DIR/simple-sandbox/<sha256(workdir)>/
 
 State is reused by later invocations from the same physical working directory.
 
-It is **not durable storage**. Runtime state normally disappears when `XDG_RUNTIME_DIR` is cleaned up at session end.
+`$XDG_STATE_HOME` must be absolute and defaults to `~/.local/state`. Only the sandbox's
+`XDG_RUNTIME_DIR` mount is backed by `/run` and disappears when that runtime
+directory is cleaned up at session end.
+
+Policies may not overlap the sandbox state directory or its runtime directory;
+this prevents private-home and overlay data from being exposed back into the
+sandbox.
 
 The optional configuration file is specified via:
 

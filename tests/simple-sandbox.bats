@@ -94,14 +94,18 @@ assert_die() {
     assert_die "must not be group or world writable"
 }
 
+@test "refuses XDG_STATE_HOME inside the working directory" {
+    run env XDG_STATE_HOME="$PWD/state" SIMPLE_SANDBOX_CONFIG="$scratch/config.json" simple-sandbox true
+    [ "$status" -ne 0 ]
+    assert_die "XDG_STATE_HOME must not be inside the working directory"
+}
+
 # ---------- Category 2: real sandbox behavior (requires bwrap) ----------
 
 integration_setup() {
     command -v bwrap >/dev/null || skip "bwrap not installed"
-    # The private home lives under the sandbox state root, which is created
-    # under XDG_RUNTIME_DIR, so it must live outside $HOME. /tmp is world-
-    # writable on CI, which the script rejects; /run/user/<uid> is the
-    # standard location: owned, 0700, on tmpfs.
+    # Runtime state belongs under /run/user/<uid>, while persistent private
+    # homes live in a test-specific XDG_STATE_HOME on disk.
     local rt
     rt="/run/user/$(id -u)"
     [[ -d "$rt" && -O "$rt" ]] || skip "no suitable runtime dir outside \$HOME: $rt"
@@ -122,6 +126,9 @@ integration_setup() {
     export XDG_RUNTIME_DIR="$rt/simple-sandbox-bats-$$"
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 700 "$XDG_RUNTIME_DIR"
+    export XDG_STATE_HOME="$scratch/state"
+    mkdir -p "$XDG_STATE_HOME"
+    chmod 700 "$XDG_STATE_HOME"
     export SIMPLE_SANDBOX_CONFIG="$scratch/config.json"
     extra_cleanup+=("$XDG_RUNTIME_DIR")
 }
@@ -159,6 +166,10 @@ run_sandbox() {
     run_sandbox bash -c 'test -e "$HOME/.simple-sandbox-bats-private-marker" && test ! -e "$HOME/.simple-sandbox-bats-host-marker"'
     [ "$status" -eq 0 ]
     [ ! -e "$HOME/.simple-sandbox-bats-private-marker" ]
+
+    local state_id
+    state_id="$(printf '%s' "$PWD" | sha256sum | cut -d' ' -f1)"
+    [ -e "$XDG_STATE_HOME/simple-sandbox/$state_id/home/.simple-sandbox-bats-private-marker" ]
 }
 
 @test "refuses a policy that would expose HOME itself" {
@@ -167,6 +178,14 @@ run_sandbox() {
     run_sandbox true
     [ "$status" -ne 0 ]
     assert_die "refusing to apply a path policy to HOME itself"
+}
+
+@test "refuses a policy that overlaps sandbox state" {
+    integration_setup
+    printf '{"paths": {"%s": "expose"}}\n' "$XDG_STATE_HOME/simple-sandbox" > "$scratch/config.json"
+    run_sandbox true
+    [ "$status" -ne 0 ]
+    assert_die "refusing a path policy that overlaps sandbox state"
 }
 
 @test "hide policy blocks read of a path" {
