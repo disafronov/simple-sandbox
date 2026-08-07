@@ -188,6 +188,18 @@ run_sandbox() {
     [ "$(cat "$scratch/ro/file.txt")" = "before" ]
 }
 
+@test "readonly policy preserves executable mode" {
+    integration_setup
+    mkdir -p "$scratch/ro"
+    printf '#!/bin/sh\nprintf executable\n' > "$scratch/ro/command"
+    chmod 755 "$scratch/ro/command"
+    printf '{"paths": {"%s": "readonly"}}\n' "$scratch/ro/command" > "$scratch/config.json"
+
+    run_sandbox "$scratch/ro/command"
+    [ "$status" -eq 0 ]
+    [ "$output" = "executable" ]
+}
+
 @test "expose policy binds the real dir read-write" {
     integration_setup
     mkdir -p "$scratch/expose"

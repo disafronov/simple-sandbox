@@ -187,7 +187,7 @@ The final path component is preserved while symlinked parent directories are can
 | Policy | Meaning |
 |--------|---------|
 | `hide` | Directory → `tmpfs`; file → read-only bind of `/dev/null`. |
-| `readonly` | Rebind read-only. |
+| `readonly` | Rebind read-only while preserving the source mode bits, including execute permission. |
 | `expose` | Read-write bind from the host. |
 | `overlay` | Runtime overlay with a private upper layer. |
 
