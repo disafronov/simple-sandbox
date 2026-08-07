@@ -115,6 +115,18 @@ home_root="$("${tools[realpath]}" "$HOME")" ||
     die "a HOME pointing at the filesystem root cannot be sandboxed behind a private mount"
 runtime_root="$("${tools[realpath]}" "$XDG_RUNTIME_DIR")" ||
     die "cannot resolve XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+state_home="${XDG_STATE_HOME:-$home_root/.local/state}"
+[[ "$state_home" == /* ]] ||
+    die "XDG_STATE_HOME must be an absolute path"
+state_base="$("${tools[realpath]}" -m -- "$state_home")" ||
+    die "cannot resolve XDG_STATE_HOME"
+[[ "$state_base" != "/" ]] ||
+    die "XDG_STATE_HOME must not be the filesystem root"
+case "$state_base" in
+    "$workdir"|"$workdir"/*)
+        die "XDG_STATE_HOME must not be inside the working directory"
+        ;;
+esac
 
 "${tools[bwrap]}" --help 2>&1 | "${tools[grep]}" -q -- '--overlay-src' ||
     die "installed bubblewrap does not support persistent overlays"
@@ -125,17 +137,24 @@ sandbox_id="$(
         "${tools[cut]}" -d' ' -f1
 )"
 
-sandbox_root="$runtime_root/simple-sandbox/$sandbox_id"
-# Per-workdir private writable home used to hide the real one.
-private_home="$sandbox_root/home"
-sandbox_runtime="$sandbox_root/runtime"
-overlays_root="$sandbox_root/overlays"
-lock_file="$sandbox_root/lock"
+state_sandbox_root="$state_base/simple-sandbox/$sandbox_id"
+runtime_sandbox_root="$runtime_root/simple-sandbox/$sandbox_id"
+# Per-workdir private writable home used to hide the real one.  It belongs in
+# XDG_STATE_HOME: package caches and tool state must not consume /run tmpfs.
+private_home="$state_sandbox_root/home"
+sandbox_runtime="$runtime_sandbox_root/runtime"
+overlays_root="$state_sandbox_root/overlays"
+lock_file="$state_sandbox_root/lock"
 
-[[ ! -L "$runtime_root/simple-sandbox" ]] ||
-    die "refusing symlink: $runtime_root/simple-sandbox"
-[[ ! -L "$sandbox_root" ]] ||
-    die "refusing symlink: $sandbox_root"
+for path in \
+    "$state_base/simple-sandbox" \
+    "$state_sandbox_root" \
+    "$runtime_root/simple-sandbox" \
+    "$runtime_sandbox_root"
+do
+    [[ ! -L "$path" ]] ||
+        die "refusing symlink: $path"
+done
 
 "${tools[mkdir]}" -p \
     "$private_home" \
@@ -143,8 +162,11 @@ lock_file="$sandbox_root/lock"
     "$overlays_root"
 
 "${tools[chmod]}" 700 \
-    "$sandbox_root" \
+    "$state_base/simple-sandbox" \
+    "$state_sandbox_root" \
     "$private_home" \
+    "$runtime_root/simple-sandbox" \
+    "$runtime_sandbox_root" \
     "$sandbox_runtime" \
     "$overlays_root"
 
@@ -214,6 +236,8 @@ resolve_policy_path() {
     local variable
     local parent
     local name
+    local canonical_path
+    local protected_path
 
     while IFS= read -r variable; do
         if [[ ! -v "$variable" ]]; then
@@ -264,6 +288,35 @@ resolve_policy_path() {
     parent="$("${tools[realpath]}" -m -- "$parent")" ||
         die "cannot resolve policy parent: $parent"
     path="${parent%/}/$name"
+
+    # The sandbox state contains the private home and writable overlay data.
+    # Do not let any policy reveal it, whether it names the state itself, a
+    # child, or an ancestor that would contain it. Check the fully resolved
+    # form as well so a final-component symlink cannot bypass this boundary.
+    canonical_path="$("${tools[realpath]}" -m -- "$path")" ||
+        die "cannot resolve policy path: $path"
+    for protected_path in "$state_sandbox_root" "$runtime_sandbox_root"; do
+        case "$path" in
+            "$protected_path"|"$protected_path"/*)
+                die "refusing a path policy that overlaps sandbox state: $path"
+                ;;
+        esac
+        case "$protected_path" in
+            "$path"/*)
+                die "refusing a path policy that overlaps sandbox state: $path"
+                ;;
+        esac
+        case "$canonical_path" in
+            "$protected_path"|"$protected_path"/*)
+                die "refusing a path policy that overlaps sandbox state: $path"
+                ;;
+        esac
+        case "$protected_path" in
+            "$canonical_path"/*)
+                die "refusing a path policy that overlaps sandbox state: $path"
+                ;;
+        esac
+    done
 
     printf '%s\n' "$path"
 }
