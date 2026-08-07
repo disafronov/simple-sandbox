@@ -147,7 +147,8 @@ When unset, the default path is:
 ${XDG_CONFIG_HOME:-~/.config}/simple-sandbox.json
 ```
 
-Missing configuration files are silently ignored.
+The default configuration file is silently ignored when missing. A path set
+explicitly through `SIMPLE_SANDBOX_CONFIG` must exist.
 
 ---
 
@@ -244,4 +245,4 @@ Each name must match:
 - **Policies are explicit.** Paths remain readable unless hidden by policy.
 - **The host network is shared.** No network namespace isolation is performed.
 - **No syscall filtering.** No seccomp or similar syscall restrictions are applied.
-- **Runtime state is ephemeral.** Private-home and overlay state is intended for temporary execution state, not persistent storage.
+- **Sandbox state is persistent per workdir.** Private-home and overlay state live under `$XDG_STATE_HOME`; only the sandbox `XDG_RUNTIME_DIR` is session-scoped.
