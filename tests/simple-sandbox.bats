@@ -98,28 +98,27 @@ assert_die() {
 
 integration_setup() {
     command -v bwrap >/dev/null || skip "bwrap not installed"
-    # The HOME overlay uses lowerdir=$HOME, and overlayfs forbids an
-    # upperdir/workdir inside a lowerdir. The state root is created under
-    # XDG_RUNTIME_DIR, so it must live outside $HOME (and /tmp is world-
-    # writable on CI, which the script rejects). /run/user/<uid> is the
+    # The private home lives under the sandbox state root, which is created
+    # under XDG_RUNTIME_DIR, so it must live outside $HOME. /tmp is world-
+    # writable on CI, which the script rejects; /run/user/<uid> is the
     # standard location: owned, 0700, on tmpfs.
     local rt
     rt="/run/user/$(id -u)"
     [[ -d "$rt" && -O "$rt" ]] || skip "no suitable runtime dir outside \$HOME: $rt"
-    # Probe that a $HOME overlay can actually be mounted here: some
-    # environments (e.g. a $HOME that is itself an overlayfs mount) make the
-    # kernel refuse nested overlays with EINVAL, which would break every
-    # integration test at the first bwrap call.
-    local probe_u probe_w
-    probe_u="$(mktemp -d /tmp/ss-probe-u.XXXXXX)"
-    probe_w="$(mktemp -d /tmp/ss-probe-w.XXXXXX)"
+    # Probe that a private-home bind can actually be mounted here: the whole
+    # base suite depends on binding a fresh directory over $HOME, so bail out
+    # early if the kernel refuses it.
+    local probe_home probe_dest
+    probe_home="$(mktemp -d /tmp/ss-probe-home.XXXXXX)"
+    probe_dest="$HOME/.ss-probe"
     if ! bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev \
-        --overlay-src "$HOME" --overlay "$probe_u" "$probe_w" "$HOME" \
-        true 2>/dev/null; then
-        rm -rf -- "$probe_u" "$probe_w"
-        skip "HOME overlay unavailable in this environment (nested overlayfs?)"
+        --bind "$probe_home" "$HOME" \
+        sh -c "echo probe > '$probe_dest'" 2>/dev/null \
+        || [[ ! -f "$probe_home/.ss-probe" ]]; then
+        rm -rf -- "$probe_home"
+        skip "private-home bind unavailable in this environment"
     fi
-    rm -rf -- "$probe_u" "$probe_w"
+    rm -rf -- "$probe_home"
     export XDG_RUNTIME_DIR="$rt/simple-sandbox-bats-$$"
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 700 "$XDG_RUNTIME_DIR"
@@ -131,17 +130,43 @@ run_sandbox() {
     run env SIMPLE_SANDBOX_CONFIG="$scratch/config.json" simple-sandbox "$@"
 }
 
-@test "cwd is writable, home overlay hides real edits" {
+@test "cwd is writable, real home stays hidden" {
     integration_setup
-    echo before > "$HOME/.simple-sandbox-bats-marker"
-    extra_cleanup+=("$HOME/.simple-sandbox-bats-marker")
+    # A sentinel in the real home must be invisible inside the sandbox.
+    echo real-home > "$HOME/.simple-sandbox-bats-sentinel"
+    extra_cleanup+=("$HOME/.simple-sandbox-bats-sentinel")
     mkdir -p "$scratch/project"
     cd "$scratch/project"
-    # shellcheck disable=SC2016  # $HOME must expand inside the sandbox, not here
-    run_sandbox bash -c 'echo after > "$HOME/.simple-sandbox-bats-marker"; touch ./project-file'
+    run_sandbox bash -c "test ! -e '$HOME/.simple-sandbox-bats-sentinel' && echo inside > '$HOME/.simple-sandbox-bats-marker' && touch ./project-file"
     [ "$status" -eq 0 ]
+    # The cwd is a read-write bind of the real project dir by design,
+    # even when it lives inside $HOME.
     [ -f "$scratch/project/project-file" ]
-    [ "$(cat "$HOME/.simple-sandbox-bats-marker")" = "before" ]
+    # Writes to $HOME land in the private home, never in the real one.
+    [ ! -e "$HOME/.simple-sandbox-bats-marker" ]
+}
+
+@test "private home survives later invocations without exposing real-home files" {
+    integration_setup
+    mkdir -p "$scratch/project"
+    cd "$scratch/project"
+    echo host-only > "$HOME/.simple-sandbox-bats-host-marker"
+    extra_cleanup+=("$HOME/.simple-sandbox-bats-host-marker")
+
+    run_sandbox bash -c 'touch "$HOME/.simple-sandbox-bats-private-marker"'
+    [ "$status" -eq 0 ]
+
+    run_sandbox bash -c 'test -e "$HOME/.simple-sandbox-bats-private-marker" && test ! -e "$HOME/.simple-sandbox-bats-host-marker"'
+    [ "$status" -eq 0 ]
+    [ ! -e "$HOME/.simple-sandbox-bats-private-marker" ]
+}
+
+@test "refuses a policy that would expose HOME itself" {
+    integration_setup
+    printf '{"paths": {"%s": "readonly"}}\n' "$HOME" > "$scratch/config.json"
+    run_sandbox true
+    [ "$status" -ne 0 ]
+    assert_die "refusing to apply a path policy to HOME itself"
 }
 
 @test "hide policy blocks read of a path" {
@@ -175,6 +200,21 @@ run_sandbox() {
 
 @test "overlay policy gives a writable view without leaking" {
     integration_setup
+    # The overlay path policy is the only feature that needs bwrap overlay
+    # support; probe it locally and skip just this test when unavailable.
+    local probe_base probe_upper probe_work
+    probe_base="$(mktemp -d /tmp/ss-overlay-base.XXXXXX)"
+    probe_upper="$(mktemp -d /tmp/ss-overlay-upper.XXXXXX)"
+    probe_work="$(mktemp -d /tmp/ss-overlay-work.XXXXXX)"
+    echo before > "$probe_base/file.txt"
+    if ! bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev \
+        --overlay-src "$probe_base" --overlay "$probe_upper" "$probe_work" "$probe_base" \
+        sh -c "echo after > '$probe_base/file.txt'" 2>/dev/null \
+        || [[ "$(cat "$probe_base/file.txt")" != "before" ]]; then
+        rm -rf -- "$probe_base" "$probe_upper" "$probe_work"
+        skip "overlay not supported by bubblewrap"
+    fi
+    rm -rf -- "$probe_base" "$probe_upper" "$probe_work"
     mkdir -p "$scratch/overlay"
     echo before > "$scratch/overlay/file.txt"
     printf '{"paths": {"%s": "overlay"}}\n' "$scratch/overlay" > "$scratch/config.json"
