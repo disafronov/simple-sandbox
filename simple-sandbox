@@ -128,9 +128,6 @@ case "$state_base" in
         ;;
 esac
 
-"${tools[bwrap]}" --help 2>&1 | "${tools[grep]}" -q -- '--overlay-src' ||
-    die "installed bubblewrap does not support persistent overlays"
-
 sandbox_id="$(
     printf '%s' "$workdir" |
         "${tools[sha256sum]}" |
@@ -230,6 +227,19 @@ if [[ -n "$config_file" ]]; then
         "${tools[jq]}" -r '.unset // [] | .[]' "$config_file"
     )
 fi
+
+# Persistent overlay support is required only when an overlay policy exists.
+for action in "${policy_actions[@]}"; do
+    [[ "$action" == overlay ]] || continue
+
+    bwrap_help="$("${tools[bwrap]}" --help)" ||
+        die "failed to query bubblewrap capabilities"
+
+    "${tools[grep]}" -q -- '--overlay-src' <<< "$bwrap_help" ||
+        die "installed bubblewrap does not support persistent overlays"
+
+    break
+done
 
 resolve_policy_path() {
     local path="$1"
