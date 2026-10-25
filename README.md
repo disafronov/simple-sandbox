@@ -31,7 +31,7 @@ Configuration is optional and exists only to extend this baseline with path-spec
 - **Hierarchical path policies** — parent paths are applied before child paths, allowing narrow exceptions inside broader rules without depending on configuration order.
 - **Environment sanitization** — canonical `TMPDIR`, `XDG_RUNTIME_DIR` and `HOME`, plus an optional `unset` list for sensitive environment variables.
 - **Concurrency-safe** — per-instance `flock` serializes concurrent sandboxes sharing the same per-workdir private home and runtime state so they cannot corrupt each other.
-- **Trusted launcher** — every external tool the wrapper invokes is resolved to a canonical absolute path and rejected if it resides inside the writable working directory. `bash` is pinned via the fixed `#!/bin/bash` shebang and is never resolved through `PATH`.
+- **Launcher path checks** — external tools are resolved to canonical absolute paths and rejected if they reside inside the writable working directory. `bash` is pinned via the fixed `#!/bin/bash` shebang for normal script execution. The initial `realpath` invocation occurs before `realpath` itself has been checked; see Limitations.
 - **Runtime validation** — refuses a setuid `bwrap`; verifies bind-mount support and, only when the `overlay` path policy is used, overlay support; validates `XDG_RUNTIME_DIR` ownership and permissions; refuses symlinked state paths; creates private runtime state with `0700` permissions.
 - **Strict policy validation** — configuration is strictly validated; invalid paths, conflicting rules, attempts to apply policies to `/`, and malformed environment variable names abort startup.
 - **Zero privileges** — everything runs as the invoking user. No root privileges and no setuid `bwrap`.
@@ -241,8 +241,10 @@ Each name must match:
 
 ## Limitations
 
-- **The host filesystem is readable by default.** Only writes are restricted. Use `hide` policies for paths that must not be visible.
-- **Policies are explicit.** Paths remain readable unless hidden by policy.
+- **The host filesystem is readable by default.** Read-only mounts restrict filesystem writes, not access to readable paths. Use explicit `hide` policies for paths that must not be visible.
+- **Host UNIX sockets may remain accessible.** A read-only mount does not prevent connecting to a visible UNIX-domain socket when permissions allow it. For example, access to a host Docker socket may grant control over the Docker daemon. Hide sensitive socket paths explicitly; the wrapper does not discover or block them automatically.
 - **The host network is shared.** No network namespace isolation is performed.
 - **No syscall filtering.** No seccomp or similar syscall restrictions are applied.
+- **The initial `realpath` invocation is not verified.** Tool resolution calls `realpath` through `PATH` before its own path has been canonicalized and checked. Subsequent absolute-path checks do not establish trust in that first invocation. Do not treat launcher path checks as a complete defense against an untrusted `PATH`.
+- **The caller's terminal session is shared.** The wrapper does not pass `--new-session` to Bubblewrap. Depending on kernel and terminal settings, terminal-related operations such as `TIOCSTI` may remain possible; this behavior has not been verified across supported environments.
 - **Sandbox state is persistent per workdir.** Private-home and overlay state live under `$XDG_STATE_HOME`; only the sandbox `XDG_RUNTIME_DIR` is session-scoped.
